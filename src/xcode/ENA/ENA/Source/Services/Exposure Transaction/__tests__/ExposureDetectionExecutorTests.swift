@@ -80,11 +80,12 @@ final class ExposureDetectionExecutorTests: XCTestCase {
 
 	func testDownloadDelta_GetDeltaSuccess() throws {
 		let cal = Calendar(identifier: .gregorian)
-		let today = cal.startOfDay(for: Date()).formatted
-		let yesterday = try XCTUnwrap(cal.date(byAdding: DateComponents(day: -1), to: Date())?.formatted)
+		let startOfToday = cal.startOfDay(for: Date())
+		let todayString = startOfToday.formatted
+		let yesterdayString = try XCTUnwrap(cal.date(byAdding: DateComponents(day: -1), to: startOfToday)?.formatted)
 
-		let remoteDaysAndHours: DaysAndHours = ([yesterday, today], [])
-		let localDaysAndHours: DaysAndHours = ([yesterday], [])
+		let remoteDaysAndHours: DaysAndHours = ([yesterdayString, todayString], [])
+		let localDaysAndHours: DaysAndHours = ([yesterdayString], [])
 
 		downloadedPackageStore.set(day: localDaysAndHours.days[0], package: try .makePackage())
 
@@ -98,7 +99,7 @@ final class ExposureDetectionExecutorTests: XCTestCase {
 
 		let missingDaysAndHours = sut.exposureDetection(ExposureDetection(delegate: detectionDelegate), downloadDeltaFor: remoteDaysAndHours)
 
-		XCTAssertEqual(missingDaysAndHours.days, [today])
+		XCTAssertEqual(missingDaysAndHours.days, [todayString])
 	}
 
 	func testDownloadDelta_TestStoreIsPruned() throws {
@@ -146,6 +147,143 @@ final class ExposureDetectionExecutorTests: XCTestCase {
 		}
 
 		waitForExpectations(timeout: 2.0)
+	}
+
+	// MARK: - Download Configuration Tests
+
+	func testDownloadConfiguration_Success() throws {
+		// swiftlint:disable:next force_unwrapping
+		let url = Bundle(for: type(of: self)).url(forResource: "de-config", withExtension: nil)!
+		let stack = MockNetworkStack(
+			httpStatus: 200,
+			responseData: try Data(contentsOf: url)
+		)
+		let completionExpectation = expectation(description: "Expect that the completion handler is called.")
+		let detectionDelegate = MockExposureDetectionDelegate()
+		let client = HTTPClient.makeWith(mock: stack)
+		let sut = ExposureDetectionExecutor(
+			client: client,
+			downloadedPackagesStore: downloadedPackageStore,
+			store: MockTestStore(),
+			exposureDetector: MockExposureDetector()
+		)
+
+		sut.exposureDetection(ExposureDetection(delegate: detectionDelegate), downloadConfiguration: { configuration in
+			defer { completionExpectation.fulfill() }
+
+			if configuration == nil {
+				XCTFail("A good client response did not produce a ENExposureConfiguration!")
+			}
+		})
+
+		waitForExpectations(timeout: 2.0)
+	}
+
+	func testDownloadConfiguration_ClientError() throws {
+		let stack = MockNetworkStack(
+			httpStatus: 500,
+			responseData: Data()
+		)
+		let completionExpectation = expectation(description: "Expect that the completion handler is called.")
+		let detectionDelegate = MockExposureDetectionDelegate()
+		let client = HTTPClient.makeWith(mock: stack)
+		let sut = ExposureDetectionExecutor(
+			client: client,
+			downloadedPackagesStore: downloadedPackageStore,
+			store: MockTestStore(),
+			exposureDetector: MockExposureDetector()
+		)
+
+		sut.exposureDetection(ExposureDetection(delegate: detectionDelegate), downloadConfiguration: { configuration in
+			defer { completionExpectation.fulfill() }
+
+			if configuration != nil {
+				XCTFail("A bad client response should not produce a ENExposureConfiguration!")
+			}
+		})
+
+		waitForExpectations(timeout: 2.0)
+	}
+
+	// MARK: - Write Downloaded Package Tests
+
+	func testWriteDownloadedPackage_NoHourlyFetching() throws {
+		let todayString = Calendar(identifier: .gregorian).startOfDay(for: Date()).formatted
+		try downloadedPackageStore.set(day: todayString, package: .makePackage())
+		try downloadedPackageStore.set(hour: 3, day: todayString, package: .makePackage())
+		let store = MockTestStore()
+		store.hourlyFetchingEnabled = false
+
+		let detectionDelegate = MockExposureDetectionDelegate()
+		let sut = ExposureDetectionExecutor(
+			client: ClientMock(),
+			downloadedPackagesStore: downloadedPackageStore,
+			store: store,
+			exposureDetector: MockExposureDetector()
+		)
+
+		let result = sut.exposureDetectionWriteDownloadedPackages(ExposureDetection(delegate: detectionDelegate))
+		let writtenPackages = try XCTUnwrap(result, "Written packages was unexpectedly nil!")
+
+		XCTAssertFalse(
+			writtenPackages.urls.isEmpty,
+			"The package was not saved!"
+		)
+		XCTAssertTrue(
+			writtenPackages.urls.count == 2,
+			"Hourly fetching disabled - there should only be one sig/bin combination written!"
+		)
+
+		let fileManager = FileManager.default
+		for url in writtenPackages.urls {
+			XCTAssertTrue(
+				url.absoluteString.starts(with: fileManager.temporaryDirectory.absoluteString),
+				"The packages were not written in the temporary directory!"
+			)
+		}
+		// Cleanup
+		let firstURL = try XCTUnwrap(writtenPackages.urls.first, "Written packages URLs is empty!")
+		let parentDir = firstURL.deletingLastPathComponent()
+		try fileManager.removeItem(at: parentDir)
+	}
+
+	func testWriteDownloadedPackage_HourlyFetchingEnabled() throws {
+		let todayString = Calendar(identifier: .gregorian).startOfDay(for: Date()).formatted
+		try downloadedPackageStore.set(day: todayString, package: .makePackage())
+		try downloadedPackageStore.set(hour: 3, day: todayString, package: .makePackage())
+		try downloadedPackageStore.set(hour: 4, day: todayString, package: .makePackage())
+
+		let detectionDelegate = MockExposureDetectionDelegate()
+		let sut = ExposureDetectionExecutor(
+			client: ClientMock(),
+			downloadedPackagesStore: downloadedPackageStore,
+			store: MockTestStore(),
+			exposureDetector: MockExposureDetector()
+		)
+
+		let result = sut.exposureDetectionWriteDownloadedPackages(ExposureDetection(delegate: detectionDelegate))
+		let writtenPackages = try XCTUnwrap(result, "Written packages was unexpectedly nil!")
+
+		XCTAssertFalse(
+			writtenPackages.urls.isEmpty,
+			"The package was not saved!"
+		)
+		XCTAssertTrue(
+			writtenPackages.urls.count == 4,
+			"Hourly fetching enabled - there should be two sig/bin combination written!"
+		)
+
+		let fileManager = FileManager.default
+		for url in writtenPackages.urls {
+			XCTAssertTrue(
+				url.absoluteString.starts(with: fileManager.temporaryDirectory.absoluteString),
+				"The packages were not written in the temporary directory!"
+			)
+		}
+		// Cleanup
+		let firstURL = try XCTUnwrap(writtenPackages.urls.first, "Written packages URLs is empty!")
+		let parentDir = firstURL.deletingLastPathComponent()
+		try fileManager.removeItem(at: parentDir)
 	}
 }
 
